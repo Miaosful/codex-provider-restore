@@ -1,9 +1,9 @@
 # Codex Provider Restore
 
-切换模型中转站、provider 或自定义 API endpoint 后，用于找回 Codex Desktop
+- 切换模型中转站、provider 或自定义 API endpoint 后，用于找回 Codex Desktop
 历史对话的小工具。
 
-English documentation is available below.
+- English documentation is available below.
 
 ## 中文说明
 
