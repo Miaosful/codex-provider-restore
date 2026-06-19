@@ -49,19 +49,47 @@ rollout 文件。
 
 ### 使用方法
 
-先 dry-run 查看影响范围：
+完整流程：
+
+1. 拉取工具仓库：
+
+```bash
+git clone https://github.com/Miaosful/codex-provider-restore.git
+cd codex-provider-restore
+```
+
+如果已经克隆过，进入目录后更新到最新版本：
+
+```bash
+cd codex-provider-restore
+git pull
+```
+
+2. 确认 Python 可用：
+
+```bash
+python3 --version
+```
+
+3. 可选：运行测试，确认脚本在当前环境可执行：
+
+```bash
+python3 -m unittest tests/test_codex_provider_restore.py
+```
+
+4. 先 dry-run 查看影响范围。dry-run 不会修改任何文件或数据库：
 
 ```bash
 python3 codex_provider_restore.py
 ```
 
-确认输出符合预期后执行修复：
+5. 确认输出符合预期后，建议先退出 Codex Desktop，再执行修复：
 
 ```bash
 python3 codex_provider_restore.py --apply
 ```
 
-执行后刷新或重启 Codex Desktop。
+6. 重新打开 Codex Desktop，或在应用内刷新窗口。左侧历史会话应恢复，旧会话点击时不应再因为旧 provider 报错。
 
 ### 常用参数
 
@@ -162,19 +190,47 @@ The script only uses Python standard library modules.
 
 ### Usage
 
-Run a dry run first:
+Full flow:
+
+1. Clone the tool repository:
+
+```bash
+git clone https://github.com/Miaosful/codex-provider-restore.git
+cd codex-provider-restore
+```
+
+If you already cloned it, update it first:
+
+```bash
+cd codex-provider-restore
+git pull
+```
+
+2. Check that Python is available:
+
+```bash
+python3 --version
+```
+
+3. Optional: run the tests to confirm the script works in your environment:
+
+```bash
+python3 -m unittest tests/test_codex_provider_restore.py
+```
+
+4. Run a dry run first. Dry-run mode does not change files or database rows:
 
 ```bash
 python3 codex_provider_restore.py
 ```
 
-If the output looks right, apply the restore:
+5. If the output looks right, quit Codex Desktop and apply the restore:
 
 ```bash
 python3 codex_provider_restore.py --apply
 ```
 
-Restart or refresh Codex Desktop after applying.
+6. Reopen Codex Desktop or refresh the app window. The left-side conversation list should be restored, and older threads should no longer fail because of missing legacy providers.
 
 ### Common Options
 
