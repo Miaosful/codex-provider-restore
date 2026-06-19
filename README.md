@@ -22,8 +22,10 @@ Codex Desktop 会把 provider 元数据保存在两处：
 failed to load configuration: Model provider `custom` not found
 ```
 
-这个工具会把数据库索引和 rollout 元数据统一到当前 provider，同时不修改原始
-rollout 文件。
+这个工具会把数据库索引和 rollout 元数据统一到当前 provider，并保持
+`rollout_path` 指向原始会话文件。旧版本曾把数据库指向恢复目录中的 rollout
+副本，这会让 Codex Desktop 的左侧会话列表继续丢失；当前版本会识别并修回这种
+错误路径。
 
 ### 安全策略
 
@@ -33,15 +35,16 @@ rollout 文件。
 
 1. 从 `~/.codex/config.toml` 读取当前 `model_provider`。
 2. 修改数据库前创建 SQLite 备份。
-3. 把 rollout 文件复制到单独的恢复目录。
-4. 只改复制出来的 rollout 元数据。
-5. 更新 `state_5.sqlite`，让 Codex 读取修正后的副本。
+3. 修改 rollout 前把原始 rollout 备份到单独的恢复目录。
+4. 原地更新 rollout 元数据里的 provider。
+5. 更新 `state_5.sqlite` 的 provider，并把旧版本造成的恢复目录路径修回原始
+   `~/.codex/sessions` 或 `~/.codex/archived_sessions` 路径。
 
-原始 `~/.codex/sessions` 和 `~/.codex/archived_sessions` 文件不会被修改。
+数据库中的 `rollout_path` 不会被改到恢复目录；恢复目录只保存备份。
 
 ### 环境要求
 
-- macOS 或 Linux
+- 仅适用于 macOS
 - 推荐 Python 3.11 或更新版本
 - Codex Desktop 本地状态目录位于 `~/.codex`
 
@@ -115,7 +118,7 @@ python3 codex_provider_restore.py \
 Mode: DRY RUN
 Target provider: anyrouter
 Threads to update: 172
-Rollout copies: 172
+Rollouts to rewrite: 172
 Missing rollout files: 0
 Run directory: /Users/you/.codex/provider-restore-rollouts/20260619-144125
 No files or database rows were changed. Re-run with --apply to restore.
@@ -140,7 +143,7 @@ python3 -m py_compile codex_provider_restore.py tests/test_codex_provider_restor
 ### 回滚
 
 如果需要撤销恢复，请先关闭 Codex Desktop，然后使用工具输出的 SQLite 备份还原
-`state_5.sqlite`。原始 rollout 文件没有被改动，因为工具只写入修正副本。
+`state_5.sqlite`，并按需从该次运行目录里的 `rollout-backups` 还原 rollout 文件。
 
 ## English
 
@@ -162,8 +165,11 @@ can appear missing or fail with errors like:
 failed to load configuration: Model provider `custom` not found
 ```
 
-This tool realigns both layers to the current provider while keeping the
-original rollout files untouched.
+This tool realigns both layers to the current provider while keeping
+`rollout_path` pointed at the original session files. Older versions pointed
+the database at rollout copies under the restore directory, which can keep the
+Codex Desktop conversation list hidden; the current version detects and repairs
+that path shape.
 
 ### Safety Model
 
@@ -173,16 +179,17 @@ When run with `--apply`, it:
 
 1. Reads the current `model_provider` from `~/.codex/config.toml`.
 2. Creates a SQLite backup before making database changes.
-3. Copies rollout files into a separate restore directory.
-4. Rewrites only the copied rollout metadata to the target provider.
-5. Updates `state_5.sqlite` so Codex reads the corrected copies.
+3. Backs up rollout files before changing them.
+4. Rewrites rollout provider metadata in place.
+5. Updates `state_5.sqlite` provider values and repairs restore-directory
+   `rollout_path` values back to the original session paths.
 
-The original `~/.codex/sessions` and `~/.codex/archived_sessions` files are not
-modified.
+The restore directory is used only for backups; database `rollout_path` values
+stay on the original session or archived-session files.
 
 ### Requirements
 
-- macOS or Linux
+- macOS only
 - Python 3.11 or newer recommended
 - Codex Desktop local state at `~/.codex`
 
@@ -258,7 +265,7 @@ The tool prints a summary like:
 Mode: DRY RUN
 Target provider: anyrouter
 Threads to update: 172
-Rollout copies: 172
+Rollouts to rewrite: 172
 Missing rollout files: 0
 Run directory: /Users/you/.codex/provider-restore-rollouts/20260619-144125
 No files or database rows were changed. Re-run with --apply to restore.
@@ -283,5 +290,5 @@ python3 -m py_compile codex_provider_restore.py tests/test_codex_provider_restor
 ### Recovery Notes
 
 If you need to undo a restore, close Codex Desktop and restore the SQLite backup
-printed by the tool. The original rollout files remain in place because the
-tool only writes corrected copies.
+printed by the tool. Restore rollout files from that run's `rollout-backups`
+directory if you need to undo rollout metadata changes too.

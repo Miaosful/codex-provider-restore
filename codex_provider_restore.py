@@ -2,8 +2,8 @@
 """
 Restore Codex Desktop thread visibility after switching model providers.
 
-Default mode is dry-run. Use --apply to write a SQLite backup, create corrected
-rollout copies, and point the thread index at those copies.
+Default mode is dry-run. Use --apply to write backups, update the SQLite
+provider index, and rewrite rollout provider metadata in place.
 """
 
 from __future__ import annotations
@@ -30,11 +30,11 @@ DEFAULT_CODEX_HOME = Path.home() / ".codex"
 class RestoreResult:
     target_provider: str
     updated_threads: int
-    copied_rollouts: int
+    rewritten_rollouts: int
     missing_rollouts: int
     backup_path: Path | None
     run_dir: Path
-    copied_paths: dict[str, str]
+    rollout_backup_paths: dict[str, str]
 
 
 def read_model_provider(config_path: Path) -> str:
@@ -70,17 +70,36 @@ def fetch_threads(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
     ]
 
 
+def original_path_from_restore_copy(rollout_path: str, output_root: Path) -> str:
+    path = Path(rollout_path).expanduser()
+    root = output_root.expanduser()
+    path_parts = path.parts
+    root_parts = root.parts
+    rollouts_index = len(root_parts) + 1
+
+    if (
+        len(path_parts) > rollouts_index + 1
+        and path_parts[: len(root_parts)] == root_parts
+        and path_parts[rollouts_index] == "rollouts"
+    ):
+        original_path = Path(path.anchor, *path_parts[rollouts_index + 1 :])
+        if original_path.exists():
+            return str(original_path)
+
+    return rollout_path
+
+
 def make_run_dir(output_root: Path, timestamp: str) -> Path:
     return output_root.expanduser().resolve() / timestamp
 
 
-def destination_for_rollout(run_dir: Path, source_path: Path) -> Path:
+def destination_for_rollout_backup(run_dir: Path, source_path: Path) -> Path:
     source_path = source_path.expanduser()
     if source_path.is_absolute():
         relative_parts = source_path.parts[1:]
     else:
         relative_parts = source_path.parts
-    return run_dir / "rollouts" / Path(*relative_parts)
+    return run_dir / "rollout-backups" / Path(*relative_parts)
 
 
 def rewrite_rollout_text(text: str, target_provider: str) -> str:
@@ -95,19 +114,26 @@ def rewrite_rollout_text(text: str, target_provider: str) -> str:
             continue
 
         payload = record.get("payload") if isinstance(record, dict) else None
-        if isinstance(payload, dict) and "model_provider" in payload:
+        if (
+            isinstance(payload, dict)
+            and "model_provider" in payload
+            and payload["model_provider"] != target_provider
+        ):
             payload["model_provider"] = target_provider
-        output_lines.append(json.dumps(record, ensure_ascii=False) + newline)
+            output_lines.append(json.dumps(record, ensure_ascii=False) + newline)
+            continue
+
+        output_lines.append(line)
     return "".join(output_lines)
 
 
-def copy_rewritten_rollouts(
+def rewrite_rollouts_in_place(
     rollout_paths: Iterable[str],
     run_dir: Path,
     target_provider: str,
     apply: bool,
 ) -> tuple[dict[str, str], int]:
-    copied_paths: dict[str, str] = {}
+    backup_paths: dict[str, str] = {}
     missing_count = 0
 
     for rollout_path in sorted(set(path for path in rollout_paths if path)):
@@ -116,16 +142,21 @@ def copy_rewritten_rollouts(
             missing_count += 1
             continue
 
-        destination_path = destination_for_rollout(run_dir, source_path)
-        copied_paths[str(source_path)] = str(destination_path)
+        original_text = source_path.read_text(encoding="utf-8")
+        rewritten_text = rewrite_rollout_text(original_text, target_provider)
+        if rewritten_text == original_text:
+            continue
+
+        backup_path = destination_for_rollout_backup(run_dir, source_path)
+        backup_paths[str(source_path)] = str(backup_path)
         if not apply:
             continue
 
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        rewritten_text = rewrite_rollout_text(source_path.read_text(encoding="utf-8"), target_provider)
-        destination_path.write_text(rewritten_text, encoding="utf-8")
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        backup_path.write_text(original_text, encoding="utf-8")
+        source_path.write_text(rewritten_text, encoding="utf-8")
 
-    return copied_paths, missing_count
+    return backup_paths, missing_count
 
 
 def backup_database(conn: sqlite3.Connection, run_dir: Path, state_path: Path) -> Path:
@@ -156,16 +187,24 @@ def restore_threads(
     conn = sqlite3.connect(state_path)
     try:
         threads = fetch_threads(conn)
-        copied_paths, missing_rollouts = copy_rewritten_rollouts(
-            (rollout_path for _, rollout_path, _ in threads),
+        normalized_threads = [
+            (thread_id, original_path_from_restore_copy(rollout_path, output_root), rollout_path, model_provider)
+            for thread_id, rollout_path, model_provider in threads
+        ]
+        rollout_backup_paths, missing_rollouts = rewrite_rollouts_in_place(
+            (normalized_rollout_path for _, normalized_rollout_path, _, _ in normalized_threads),
             run_dir,
             target_provider,
             apply,
         )
         updated_threads = sum(
             1
-            for _, rollout_path, model_provider in threads
-            if model_provider != target_provider or (rollout_path and rollout_path in copied_paths)
+            for _, normalized_rollout_path, db_rollout_path, model_provider in normalized_threads
+            if (
+                model_provider != target_provider
+                or db_rollout_path != normalized_rollout_path
+                or (normalized_rollout_path and normalized_rollout_path in rollout_backup_paths)
+            )
         )
 
         backup_path = None
@@ -174,21 +213,22 @@ def restore_threads(
             backup_path = backup_database(conn, run_dir, state_path)
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("UPDATE threads SET model_provider = ?", (target_provider,))
-            for source_path, destination_path in copied_paths.items():
-                conn.execute(
-                    "UPDATE threads SET rollout_path = ? WHERE rollout_path = ?",
-                    (destination_path, source_path),
-                )
+            for _, normalized_rollout_path, db_rollout_path, _ in normalized_threads:
+                if db_rollout_path != normalized_rollout_path:
+                    conn.execute(
+                        "UPDATE threads SET rollout_path = ? WHERE rollout_path = ?",
+                        (normalized_rollout_path, db_rollout_path),
+                    )
             conn.commit()
 
         return RestoreResult(
             target_provider=target_provider,
             updated_threads=updated_threads,
-            copied_rollouts=len(copied_paths),
+            rewritten_rollouts=len(rollout_backup_paths),
             missing_rollouts=missing_rollouts,
             backup_path=backup_path,
             run_dir=run_dir,
-            copied_paths=copied_paths,
+            rollout_backup_paths=rollout_backup_paths,
         )
     except Exception:
         if apply:
@@ -218,7 +258,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-root",
         type=Path,
         default=DEFAULT_CODEX_HOME / "provider-restore-rollouts",
-        help="Directory where backups and rewritten rollout copies are stored.",
+        help="Directory where SQLite and rollout backups are stored.",
     )
     parser.add_argument(
         "--provider",
@@ -237,7 +277,7 @@ def print_result(result: RestoreResult, apply: bool) -> None:
     print(f"Mode: {mode}")
     print(f"Target provider: {result.target_provider}")
     print(f"Threads to update: {result.updated_threads}")
-    print(f"Rollout copies: {result.copied_rollouts}")
+    print(f"Rollouts to rewrite: {result.rewritten_rollouts}")
     print(f"Missing rollout files: {result.missing_rollouts}")
     print(f"Run directory: {result.run_dir}")
     if result.backup_path:
