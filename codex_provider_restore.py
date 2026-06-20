@@ -59,6 +59,36 @@ def table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
 
 
+TIME_COLUMNS = ("updated_at", "updated_at_ms", "recency_at", "recency_at_ms")
+
+
+def snapshot_thread_times(conn: sqlite3.Connection) -> tuple[list[str], dict[str, tuple[int | None, ...]]]:
+    columns = [column for column in TIME_COLUMNS if column in table_columns(conn, "threads")]
+    if not columns:
+        return [], {}
+
+    selected_columns = ", ".join(["id", *columns])
+    return columns, {
+        row[0]: tuple(row[1:])
+        for row in conn.execute(f"SELECT {selected_columns} FROM threads")
+    }
+
+
+def restore_thread_times(
+    conn: sqlite3.Connection,
+    columns: list[str],
+    thread_times: dict[str, tuple[int | None, ...]],
+) -> None:
+    if not columns:
+        return
+
+    assignments = ", ".join(f"{column} = ?" for column in columns)
+    conn.executemany(
+        f"UPDATE threads SET {assignments} WHERE id = ?",
+        ((*values, thread_id) for thread_id, values in thread_times.items()),
+    )
+
+
 def fetch_threads(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
     columns = table_columns(conn, "threads")
     order_by = "updated_at_ms DESC" if "updated_at_ms" in columns else "id"
@@ -212,13 +242,18 @@ def restore_threads(
             run_dir.mkdir(parents=True, exist_ok=True)
             backup_path = backup_database(conn, run_dir, state_path)
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("UPDATE threads SET model_provider = ?", (target_provider,))
+            time_columns, thread_times = snapshot_thread_times(conn)
+            conn.execute(
+                "UPDATE threads SET model_provider = ? WHERE model_provider <> ?",
+                (target_provider, target_provider),
+            )
             for _, normalized_rollout_path, db_rollout_path, _ in normalized_threads:
                 if db_rollout_path != normalized_rollout_path:
                     conn.execute(
-                        "UPDATE threads SET rollout_path = ? WHERE rollout_path = ?",
-                        (normalized_rollout_path, db_rollout_path),
+                        "UPDATE threads SET rollout_path = ? WHERE rollout_path = ? AND rollout_path <> ?",
+                        (normalized_rollout_path, db_rollout_path, normalized_rollout_path),
                     )
+            restore_thread_times(conn, time_columns, thread_times)
             conn.commit()
 
         return RestoreResult(

@@ -39,6 +39,58 @@ def make_state_db(path, rollout_path):
     conn.close()
 
 
+def make_state_db_with_timestamps(path, rollout_path):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            model_provider TEXT NOT NULL,
+            title TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            recency_at INTEGER NOT NULL,
+            recency_at_ms INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER touch_times_after_provider_update
+        AFTER UPDATE OF model_provider ON threads
+        BEGIN
+            UPDATE threads
+            SET updated_at = 999,
+                updated_at_ms = 999000,
+                recency_at = 999,
+                recency_at_ms = 999000
+            WHERE id = NEW.id;
+        END
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO threads (
+            id, rollout_path, model_provider, title,
+            updated_at, updated_at_ms, recency_at, recency_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "thread-1",
+            str(rollout_path),
+            "custom",
+            "old provider thread",
+            100,
+            100000,
+            90,
+            90000,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
 class CodexProviderRestoreTests(unittest.TestCase):
     def test_restore_updates_rollout_in_place_and_keeps_database_path(self):
         tool = load_tool()
@@ -196,6 +248,43 @@ class CodexProviderRestoreTests(unittest.TestCase):
 
             self.assertEqual(row, ("anyrouter", str(original_rollout)))
             self.assertIn('"model_provider": "anyrouter"', original_rollout.read_text(encoding="utf-8"))
+
+    def test_restore_preserves_thread_timestamps_when_provider_update_touches_row(self):
+        tool = load_tool()
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text('model_provider = "anyrouter"\n', encoding="utf-8")
+
+            original_rollout = tmp_path / "rollout.jsonl"
+            original_rollout.write_text(
+                '{"type":"session_meta","payload":{"model_provider":"custom"}}\n',
+                encoding="utf-8",
+            )
+
+            state_path = tmp_path / "state.sqlite"
+            make_state_db_with_timestamps(state_path, original_rollout)
+
+            tool.restore_threads(
+                state_path=state_path,
+                config_path=config_path,
+                output_root=tmp_path / "restored",
+                apply=True,
+                timestamp="20260620-preserve-times",
+            )
+
+            conn = sqlite3.connect(state_path)
+            row = conn.execute(
+                """
+                SELECT model_provider, updated_at, updated_at_ms, recency_at, recency_at_ms
+                FROM threads
+                WHERE id = 'thread-1'
+                """
+            ).fetchone()
+            conn.close()
+
+            self.assertEqual(row, ("anyrouter", 100, 100000, 90, 90000))
 
 
 if __name__ == "__main__":
