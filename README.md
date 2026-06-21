@@ -42,6 +42,9 @@ failed to load configuration: Model provider `custom` not found
 
 数据库中的 `rollout_path` 不会被改到恢复目录；恢复目录只保存备份。
 
+为避免备份无限增长，`--apply` 成功后会自动清理旧运行目录，默认只保留
+`~/.codex/provider-restore-rollouts` 下最近 5 次备份。
+
 ### 环境要求
 
 - 仅适用于 macOS
@@ -112,6 +115,38 @@ python3 codex_provider_restore.py \
   --apply
 ```
 
+只清理旧备份、不修复会话：
+
+```bash
+python3 codex_provider_restore.py --cleanup-backups
+```
+
+列出可用于回滚的备份：
+
+```bash
+python3 codex_provider_restore.py --list-backups
+```
+
+预览恢复到上一次 `--apply` 前的状态：
+
+```bash
+python3 codex_provider_restore.py --rollback-latest
+```
+
+确认后执行恢复：
+
+```bash
+python3 codex_provider_restore.py --rollback-latest --apply
+```
+
+恢复到指定备份：
+
+```bash
+python3 codex_provider_restore.py \
+  --rollback ~/.codex/provider-restore-rollouts/20260621-164701 \
+  --apply
+```
+
 ### 输出示例
 
 ```text
@@ -144,6 +179,19 @@ python3 -m py_compile codex_provider_restore.py tests/test_codex_provider_restor
 
 如果需要撤销恢复，请先关闭 Codex Desktop，然后使用工具输出的 SQLite 备份还原
 `state_5.sqlite`，并按需从该次运行目录里的 `rollout-backups` 还原 rollout 文件。
+
+也可以使用内置回滚命令。默认只预览，不会修改文件：
+
+```bash
+python3 codex_provider_restore.py --rollback-latest
+```
+
+加上 `--apply` 后，工具会先把当前 SQLite 状态库备份到该运行目录的
+`rollback-backups` 下，再还原 SQLite 和 rollout 备份：
+
+```bash
+python3 codex_provider_restore.py --rollback-latest --apply
+```
 
 ## English
 
@@ -186,6 +234,10 @@ When run with `--apply`, it:
 
 The restore directory is used only for backups; database `rollout_path` values
 stay on the original session or archived-session files.
+
+To prevent backups from growing forever, a successful `--apply` run
+automatically removes old run directories and keeps only the newest 5 backups
+under `~/.codex/provider-restore-rollouts` by default.
 
 ### Requirements
 
@@ -238,6 +290,38 @@ python3 codex_provider_restore.py --apply
 ```
 
 6. Reopen Codex Desktop or refresh the app window. The left-side conversation list should be restored, and older threads should no longer fail because of missing legacy providers.
+
+Clean old backups without restoring conversations:
+
+```bash
+python3 codex_provider_restore.py --cleanup-backups
+```
+
+List backups that can be used for rollback:
+
+```bash
+python3 codex_provider_restore.py --list-backups
+```
+
+Preview restoring to the state before the latest `--apply` run:
+
+```bash
+python3 codex_provider_restore.py --rollback-latest
+```
+
+Apply that rollback:
+
+```bash
+python3 codex_provider_restore.py --rollback-latest --apply
+```
+
+Restore from a specific backup run:
+
+```bash
+python3 codex_provider_restore.py \
+  --rollback ~/.codex/provider-restore-rollouts/20260621-164701 \
+  --apply
+```
 
 ### Common Options
 
@@ -292,3 +376,18 @@ python3 -m py_compile codex_provider_restore.py tests/test_codex_provider_restor
 If you need to undo a restore, close Codex Desktop and restore the SQLite backup
 printed by the tool. Restore rollout files from that run's `rollout-backups`
 directory if you need to undo rollout metadata changes too.
+
+You can also use the built-in rollback command. By default it previews the
+rollback and does not write files:
+
+```bash
+python3 codex_provider_restore.py --rollback-latest
+```
+
+With `--apply`, the tool first backs up the current SQLite state under
+`rollback-backups` in the selected run directory, then restores the SQLite and
+rollout backups:
+
+```bash
+python3 codex_provider_restore.py --rollback-latest --apply
+```

@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -38,6 +39,25 @@ def make_state_db(path, rollout_path):
     )
     conn.commit()
     conn.close()
+
+
+def provider_for_thread(path):
+    conn = sqlite3.connect(path)
+    row = conn.execute("SELECT model_provider FROM threads WHERE id = 'thread-1'").fetchone()
+    conn.close()
+    return row[0]
+
+
+def make_restore_backup_run(output_root, run_name, state_path, rollout_path, rollout_text):
+    run_dir = output_root / run_name
+    backup_dir = run_dir / "backups"
+    backup_dir.mkdir(parents=True)
+    shutil.copy2(state_path, backup_dir / "state_5.sqlite.before-provider-restore.sqlite")
+
+    rollout_backup_path = run_dir / "rollout-backups" / Path(*rollout_path.parts[1:])
+    rollout_backup_path.parent.mkdir(parents=True)
+    rollout_backup_path.write_text(rollout_text, encoding="utf-8")
+    return run_dir
 
 
 def make_state_db_with_timestamps(path, rollout_path):
@@ -93,6 +113,167 @@ def make_state_db_with_timestamps(path, rollout_path):
 
 
 class CodexProviderRestoreTests(unittest.TestCase):
+    def test_list_backup_runs_returns_timestamped_runs_with_sqlite_backups(self):
+        tool = load_tool()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            valid_runs = ["20260621-120000", "20260621-120001"]
+            for run_name in valid_runs:
+                run_dir = output_root / run_name / "backups"
+                run_dir.mkdir(parents=True)
+                (run_dir / "state_5.sqlite.before-provider-restore.sqlite").write_text("backup", encoding="utf-8")
+            (output_root / "20260621-120002").mkdir()
+            (output_root / "notes").mkdir()
+
+            self.assertEqual([path.name for path in tool.list_backup_runs(output_root)], valid_runs)
+
+    def test_rollback_backup_run_dry_run_reports_without_modifying_files(self):
+        tool = load_tool()
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            output_root = tmp_path / "restored"
+            rollout_path = tmp_path / "rollout.jsonl"
+            rollout_path.write_text(
+                '{"type":"session_meta","payload":{"model_provider":"anyrouter"}}\n',
+                encoding="utf-8",
+            )
+            state_path = tmp_path / "state.sqlite"
+            make_state_db(state_path, rollout_path)
+            conn = sqlite3.connect(state_path)
+            conn.execute("UPDATE threads SET model_provider = 'anyrouter'")
+            conn.commit()
+            conn.close()
+
+            backup_state = tmp_path / "backup-state.sqlite"
+            make_state_db(backup_state, rollout_path)
+            run_dir = make_restore_backup_run(
+                output_root,
+                "20260621-120000",
+                backup_state,
+                rollout_path,
+                '{"type":"session_meta","payload":{"model_provider":"custom"}}\n',
+            )
+
+            result = tool.rollback_backup_run(run_dir, state_path=state_path, apply=False)
+
+            self.assertEqual(result.restored_rollouts, 1)
+            self.assertEqual(result.missing_rollouts, 0)
+            self.assertIsNone(result.current_backup_path)
+            self.assertEqual(provider_for_thread(state_path), "anyrouter")
+            self.assertIn('"model_provider":"anyrouter"', rollout_path.read_text(encoding="utf-8"))
+
+    def test_rollback_backup_run_apply_restores_sqlite_and_rollouts(self):
+        tool = load_tool()
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            output_root = tmp_path / "restored"
+            rollout_path = tmp_path / "rollout.jsonl"
+            rollout_path.write_text(
+                '{"type":"session_meta","payload":{"model_provider":"anyrouter"}}\n',
+                encoding="utf-8",
+            )
+            state_path = tmp_path / "state.sqlite"
+            make_state_db(state_path, rollout_path)
+            conn = sqlite3.connect(state_path)
+            conn.execute("UPDATE threads SET model_provider = 'anyrouter'")
+            conn.commit()
+            conn.close()
+            state_wal_path = Path(str(state_path) + "-wal")
+            state_shm_path = Path(str(state_path) + "-shm")
+            state_wal_path.write_text("stale wal", encoding="utf-8")
+            state_shm_path.write_text("stale shm", encoding="utf-8")
+
+            backup_state = tmp_path / "backup-state.sqlite"
+            make_state_db(backup_state, rollout_path)
+            run_dir = make_restore_backup_run(
+                output_root,
+                "20260621-120000",
+                backup_state,
+                rollout_path,
+                '{"type":"session_meta","payload":{"model_provider":"custom"}}\n',
+            )
+
+            result = tool.rollback_backup_run(run_dir, state_path=state_path, apply=True)
+
+            self.assertEqual(result.restored_rollouts, 1)
+            self.assertEqual(result.missing_rollouts, 0)
+            self.assertTrue(result.current_backup_path.exists())
+            self.assertEqual(provider_for_thread(state_path), "custom")
+            self.assertIn('"model_provider":"custom"', rollout_path.read_text(encoding="utf-8"))
+            self.assertFalse(state_wal_path.exists())
+            self.assertFalse(state_shm_path.exists())
+
+    def test_cleanup_backup_runs_keeps_five_newest_timestamped_directories(self):
+        tool = load_tool()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            run_names = [
+                "20260621-120000",
+                "20260621-120001",
+                "20260621-120002",
+                "20260621-120003",
+                "20260621-120004",
+                "20260621-120005",
+                "20260621-120006",
+            ]
+            for run_name in run_names:
+                (output_root / run_name / "backups").mkdir(parents=True)
+            (output_root / "notes").mkdir()
+
+            removed = tool.cleanup_backup_runs(output_root, keep=5)
+
+            self.assertEqual([path.name for path in removed], run_names[:2])
+            self.assertEqual(
+                sorted(path.name for path in output_root.iterdir()),
+                ["20260621-120002", "20260621-120003", "20260621-120004", "20260621-120005", "20260621-120006", "notes"],
+            )
+
+    def test_apply_cleans_old_backup_runs_after_successful_restore(self):
+        tool = load_tool()
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text('model_provider = "anyrouter"\n', encoding="utf-8")
+
+            original_rollout = tmp_path / "rollout.jsonl"
+            original_rollout.write_text(
+                '{"type":"session_meta","payload":{"model_provider":"custom"}}\n',
+                encoding="utf-8",
+            )
+
+            state_path = tmp_path / "state.sqlite"
+            make_state_db(state_path, original_rollout)
+
+            output_root = tmp_path / "restored"
+            old_run_names = [
+                "20260621-120000",
+                "20260621-120001",
+                "20260621-120002",
+                "20260621-120003",
+                "20260621-120004",
+            ]
+            for run_name in old_run_names:
+                (output_root / run_name / "backups").mkdir(parents=True)
+
+            result = tool.restore_threads(
+                state_path=state_path,
+                config_path=config_path,
+                output_root=output_root,
+                apply=True,
+                timestamp="20260621-120005",
+            )
+
+            self.assertEqual([path.name for path in result.removed_backup_runs], ["20260621-120000"])
+            self.assertEqual(
+                sorted(path.name for path in output_root.iterdir()),
+                ["20260621-120001", "20260621-120002", "20260621-120003", "20260621-120004", "20260621-120005"],
+            )
+
     def test_restore_updates_rollout_in_place_and_keeps_database_path(self):
         tool = load_tool()
 

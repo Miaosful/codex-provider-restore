@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +26,9 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback.
 
 
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
+DEFAULT_BACKUP_RETENTION = 5
+RUN_DIR_PATTERN = re.compile(r"^\d{8}-\d{6}$")
+SQLITE_BACKUP_NAME = "state_5.sqlite.before-provider-restore.sqlite"
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,16 @@ class RestoreResult:
     backup_path: Path | None
     run_dir: Path
     rollout_backup_paths: dict[str, str]
+    removed_backup_runs: list[Path]
+
+
+@dataclass(frozen=True)
+class RollbackResult:
+    run_dir: Path
+    sqlite_backup_path: Path
+    restored_rollouts: int
+    missing_rollouts: int
+    current_backup_path: Path | None
 
 
 def read_model_provider(config_path: Path) -> str:
@@ -124,6 +138,56 @@ def make_run_dir(output_root: Path, timestamp: str) -> Path:
     return output_root.expanduser().resolve() / timestamp
 
 
+def sqlite_backup_path_for_run(run_dir: Path) -> Path:
+    return run_dir / "backups" / SQLITE_BACKUP_NAME
+
+
+def list_backup_runs(output_root: Path) -> list[Path]:
+    output_root = output_root.expanduser()
+    if not output_root.exists():
+        return []
+
+    return sorted(
+        path
+        for path in output_root.iterdir()
+        if path.is_dir()
+        and RUN_DIR_PATTERN.match(path.name)
+        and sqlite_backup_path_for_run(path).exists()
+    )
+
+
+def timestamped_run_dirs(output_root: Path) -> list[Path]:
+    output_root = output_root.expanduser()
+    if not output_root.exists():
+        return []
+
+    return sorted(
+        path
+        for path in output_root.iterdir()
+        if path.is_dir() and RUN_DIR_PATTERN.match(path.name)
+    )
+
+
+def latest_backup_run(output_root: Path) -> Path | None:
+    backup_runs = list_backup_runs(output_root)
+    return backup_runs[-1] if backup_runs else None
+
+
+def cleanup_backup_runs(output_root: Path, keep: int = DEFAULT_BACKUP_RETENTION) -> list[Path]:
+    output_root = output_root.expanduser()
+    if keep < 0:
+        raise ValueError("keep must be 0 or greater")
+    if not output_root.exists():
+        return []
+
+    run_dirs = timestamped_run_dirs(output_root)
+    remove_count = max(0, len(run_dirs) - keep)
+    removed = run_dirs[:remove_count]
+    for run_dir in removed:
+        shutil.rmtree(run_dir)
+    return removed
+
+
 def destination_for_rollout_backup(run_dir: Path, source_path: Path) -> Path:
     source_path = source_path.expanduser()
     if source_path.is_absolute():
@@ -193,7 +257,7 @@ def rewrite_rollouts_in_place(
 
 
 def backup_database(conn: sqlite3.Connection, run_dir: Path, state_path: Path) -> Path:
-    backup_path = run_dir / "backups" / f"{state_path.name}.before-provider-restore.sqlite"
+    backup_path = sqlite_backup_path_for_run(run_dir)
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     backup_conn = sqlite3.connect(backup_path)
     try:
@@ -201,6 +265,63 @@ def backup_database(conn: sqlite3.Connection, run_dir: Path, state_path: Path) -
     finally:
         backup_conn.close()
     return backup_path
+
+
+def rollout_restore_destinations(run_dir: Path) -> list[tuple[Path, Path]]:
+    backup_root = run_dir / "rollout-backups"
+    if not backup_root.exists():
+        return []
+
+    destinations: list[tuple[Path, Path]] = []
+    for backup_path in sorted(path for path in backup_root.rglob("*") if path.is_file()):
+        relative_path = backup_path.relative_to(backup_root)
+        destinations.append((backup_path, Path(backup_path.anchor, *relative_path.parts)))
+    return destinations
+
+
+def backup_current_state_for_rollback(run_dir: Path, state_path: Path) -> Path:
+    backup_path = (
+        run_dir
+        / "rollback-backups"
+        / timestamp_now()
+        / f"{state_path.name}.before-rollback.sqlite"
+    )
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(state_path, backup_path)
+    return backup_path
+
+
+def remove_sqlite_sidecars(state_path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        sidecar_path = Path(str(state_path) + suffix)
+        if sidecar_path.exists():
+            sidecar_path.unlink()
+
+
+def rollback_backup_run(run_dir: Path, *, state_path: Path, apply: bool) -> RollbackResult:
+    run_dir = run_dir.expanduser().resolve()
+    state_path = state_path.expanduser().resolve()
+    sqlite_backup_path = sqlite_backup_path_for_run(run_dir)
+    if not sqlite_backup_path.exists():
+        raise FileNotFoundError(f"SQLite backup not found: {sqlite_backup_path}")
+
+    rollout_destinations = rollout_restore_destinations(run_dir)
+    current_backup_path = None
+    if apply:
+        current_backup_path = backup_current_state_for_rollback(run_dir, state_path)
+        remove_sqlite_sidecars(state_path)
+        shutil.copy2(sqlite_backup_path, state_path)
+        for backup_path, destination_path in rollout_destinations:
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup_path, destination_path)
+
+    return RollbackResult(
+        run_dir=run_dir,
+        sqlite_backup_path=sqlite_backup_path,
+        restored_rollouts=len(rollout_destinations),
+        missing_rollouts=0,
+        current_backup_path=current_backup_path,
+    )
 
 
 def restore_threads(
@@ -241,6 +362,7 @@ def restore_threads(
         )
 
         backup_path = None
+        removed_backup_runs: list[Path] = []
         if apply:
             run_dir.mkdir(parents=True, exist_ok=True)
             backup_path = backup_database(conn, run_dir, state_path)
@@ -258,6 +380,7 @@ def restore_threads(
                     )
             restore_thread_times(conn, time_columns, thread_times)
             conn.commit()
+            removed_backup_runs = cleanup_backup_runs(output_root)
 
         return RestoreResult(
             target_provider=target_provider,
@@ -267,6 +390,7 @@ def restore_threads(
             backup_path=backup_path,
             run_dir=run_dir,
             rollout_backup_paths=rollout_backup_paths,
+            removed_backup_runs=removed_backup_runs,
         )
     except Exception:
         if apply:
@@ -307,6 +431,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Apply changes. Without this flag, the tool only prints what it would do.",
     )
+    parser.add_argument(
+        "--cleanup-backups",
+        action="store_true",
+        help="Only remove old backup run directories under --output-root, keeping the newest 5.",
+    )
+    parser.add_argument(
+        "--list-backups",
+        action="store_true",
+        help="List backup run directories that can be used with --rollback.",
+    )
+    parser.add_argument(
+        "--rollback",
+        type=Path,
+        help="Restore from the specified backup run directory. Add --apply to write changes.",
+    )
+    parser.add_argument(
+        "--rollback-latest",
+        action="store_true",
+        help="Restore from the newest backup run under --output-root. Add --apply to write changes.",
+    )
     return parser
 
 
@@ -320,13 +464,77 @@ def print_result(result: RestoreResult, apply: bool) -> None:
     print(f"Run directory: {result.run_dir}")
     if result.backup_path:
         print(f"SQLite backup: {result.backup_path}")
+    if apply:
+        print(f"Old backup runs removed: {len(result.removed_backup_runs)}")
     if not apply:
         print("No files or database rows were changed. Re-run with --apply to restore.")
+
+
+def print_cleanup_result(output_root: Path, removed_backup_runs: list[Path]) -> None:
+    print(f"Cleanup mode: backups only")
+    print(f"Backup root: {output_root.expanduser().resolve()}")
+    print(f"Keeping newest backup runs: {DEFAULT_BACKUP_RETENTION}")
+    print(f"Old backup runs removed: {len(removed_backup_runs)}")
+
+
+def print_backup_runs(output_root: Path, backup_runs: list[Path]) -> None:
+    print(f"Backup root: {output_root.expanduser().resolve()}")
+    print(f"Backup runs: {len(backup_runs)}")
+    for backup_run in backup_runs:
+        print(backup_run)
+
+
+def print_rollback_result(result: RollbackResult, apply: bool) -> None:
+    mode = "APPLIED" if apply else "DRY RUN"
+    print(f"Rollback mode: {mode}")
+    print(f"Backup run: {result.run_dir}")
+    print(f"SQLite backup: {result.sqlite_backup_path}")
+    print(f"Rollouts to restore: {result.restored_rollouts}")
+    print(f"Missing rollout backups: {result.missing_rollouts}")
+    if result.current_backup_path:
+        print(f"Current SQLite backup: {result.current_backup_path}")
+    if not apply:
+        print("No files or database rows were changed. Re-run with --apply to rollback.")
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    action_count = sum(
+        bool(action)
+        for action in (
+            args.cleanup_backups,
+            args.list_backups,
+            args.rollback is not None,
+            args.rollback_latest,
+        )
+    )
+    if action_count > 1:
+        parser.error("Choose only one of --cleanup-backups, --list-backups, --rollback, or --rollback-latest.")
+
+    if args.cleanup_backups:
+        removed_backup_runs = cleanup_backup_runs(args.output_root)
+        print_cleanup_result(args.output_root, removed_backup_runs)
+        return 0
+
+    if args.list_backups:
+        print_backup_runs(args.output_root, list_backup_runs(args.output_root))
+        return 0
+
+    if args.rollback is not None or args.rollback_latest:
+        rollback_run_dir = args.rollback
+        if args.rollback_latest:
+            rollback_run_dir = latest_backup_run(args.output_root)
+            if rollback_run_dir is None:
+                parser.error(f"No backup runs found under {args.output_root.expanduser().resolve()}")
+        result = rollback_backup_run(
+            rollback_run_dir,
+            state_path=args.state,
+            apply=args.apply,
+        )
+        print_rollback_result(result, args.apply)
+        return 0
 
     result = restore_threads(
         state_path=args.state,
