@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -285,6 +286,36 @@ class CodexProviderRestoreTests(unittest.TestCase):
             conn.close()
 
             self.assertEqual(row, ("anyrouter", 100, 100000, 90, 90000))
+
+    def test_restore_preserves_rollout_file_mtime_when_rewriting_provider(self):
+        tool = load_tool()
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text('model_provider = "anyrouter"\n', encoding="utf-8")
+
+            original_rollout = tmp_path / "rollout.jsonl"
+            original_rollout.write_text(
+                '{"type":"session_meta","payload":{"model_provider":"custom"}}\n',
+                encoding="utf-8",
+            )
+            old_mtime_ns = 1_700_000_000_123_456_789
+            os.utime(original_rollout, ns=(old_mtime_ns, old_mtime_ns))
+
+            state_path = tmp_path / "state.sqlite"
+            make_state_db(state_path, original_rollout)
+
+            tool.restore_threads(
+                state_path=state_path,
+                config_path=config_path,
+                output_root=tmp_path / "restored",
+                apply=True,
+                timestamp="20260621-preserve-rollout-mtime",
+            )
+
+            self.assertIn('"model_provider": "anyrouter"', original_rollout.read_text(encoding="utf-8"))
+            self.assertEqual(original_rollout.stat().st_mtime_ns, old_mtime_ns)
 
 
 if __name__ == "__main__":

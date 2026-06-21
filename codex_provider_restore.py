@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -182,9 +183,11 @@ def rewrite_rollouts_in_place(
         if not apply:
             continue
 
+        original_stat = source_path.stat()
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         backup_path.write_text(original_text, encoding="utf-8")
         source_path.write_text(rewritten_text, encoding="utf-8")
+        os.utime(source_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
     return backup_paths, missing_count
 
