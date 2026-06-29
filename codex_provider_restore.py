@@ -29,6 +29,8 @@ DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_BACKUP_RETENTION = 5
 RUN_DIR_PATTERN = re.compile(r"^\d{8}-\d{6}$")
 SQLITE_BACKUP_NAME = "state_5.sqlite.before-provider-restore.sqlite"
+ROLLOUT_BACKUP_MANIFEST = "manifest.json"
+WINDOWS_DRIVE_PATH_PATTERN = re.compile(r"^([A-Za-z]):[\\/](.*)$")
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,26 @@ class RollbackResult:
     restored_rollouts: int
     missing_rollouts: int
     current_backup_path: Path | None
+
+
+class CodexRestoreArgumentParser(argparse.ArgumentParser):
+    def parse_args(self, args: list[str] | None = None, namespace: argparse.Namespace | None = None) -> argparse.Namespace:
+        parsed_args = super().parse_args(args, namespace)
+        if parsed_args.codex_home is not None:
+            codex_home = parsed_args.codex_home.expanduser()
+            if parsed_args.state is None:
+                parsed_args.state = codex_home / "state_5.sqlite"
+            if parsed_args.config is None:
+                parsed_args.config = codex_home / "config.toml"
+            if parsed_args.output_root is None:
+                parsed_args.output_root = codex_home / "provider-restore-rollouts"
+        if parsed_args.state is None:
+            parsed_args.state = DEFAULT_CODEX_HOME / "state_5.sqlite"
+        if parsed_args.config is None:
+            parsed_args.config = DEFAULT_CODEX_HOME / "config.toml"
+        if parsed_args.output_root is None:
+            parsed_args.output_root = DEFAULT_CODEX_HOME / "provider-restore-rollouts"
+        return parsed_args
 
 
 def read_model_provider(config_path: Path) -> str:
@@ -189,12 +211,87 @@ def cleanup_backup_runs(output_root: Path, keep: int = DEFAULT_BACKUP_RETENTION)
 
 
 def destination_for_rollout_backup(run_dir: Path, source_path: Path) -> Path:
-    source_path = source_path.expanduser()
-    if source_path.is_absolute():
-        relative_parts = source_path.parts[1:]
-    else:
-        relative_parts = source_path.parts
+    relative_parts = backup_relative_parts_for_path(source_path)
     return run_dir / "rollout-backups" / Path(*relative_parts)
+
+
+def backup_relative_parts_for_path(source_path: Path) -> tuple[str, ...]:
+    source_text = str(source_path.expanduser())
+    windows_match = WINDOWS_DRIVE_PATH_PATTERN.match(source_text)
+    if windows_match:
+        drive, rest = windows_match.groups()
+        return (drive, *tuple(part for part in re.split(r"[\\/]+", rest) if part))
+
+    expanded_path = Path(source_text)
+    if expanded_path.is_absolute():
+        return expanded_path.parts[1:]
+    return expanded_path.parts
+
+
+def write_rollout_backup_manifest(run_dir: Path, backup_paths: dict[str, str]) -> None:
+    if not backup_paths:
+        return
+
+    backup_root = run_dir / "rollout-backups"
+    manifest_path = backup_root / ROLLOUT_BACKUP_MANIFEST
+    manifest_rows = [
+        {
+            "source_path": source_path,
+            "backup_path": str(Path(backup_path).relative_to(backup_root)),
+        }
+        for source_path, backup_path in sorted(backup_paths.items())
+    ]
+    manifest_path.write_text(json.dumps(manifest_rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def path_from_manifest_source(source_path: str) -> Path:
+    return Path(source_path)
+
+
+def manifest_rollout_restore_destinations(run_dir: Path) -> list[tuple[Path, Path]]:
+    backup_root = run_dir / "rollout-backups"
+    manifest_path = backup_root / ROLLOUT_BACKUP_MANIFEST
+    if not manifest_path.exists():
+        return []
+
+    rows = json.loads(manifest_path.read_text(encoding="utf-8"))
+    destinations: list[tuple[Path, Path]] = []
+    for row in rows:
+        backup_path = backup_root / Path(row["backup_path"])
+        destinations.append((backup_path, path_from_manifest_source(row["source_path"])))
+    return destinations
+
+
+def legacy_rollout_restore_destinations(run_dir: Path) -> list[tuple[Path, Path]]:
+    backup_root = run_dir / "rollout-backups"
+    if not backup_root.exists():
+        return []
+
+    destinations: list[tuple[Path, Path]] = []
+    for backup_path in sorted(path for path in backup_root.rglob("*") if path.is_file()):
+        if backup_path.name == ROLLOUT_BACKUP_MANIFEST:
+            continue
+        relative_path = backup_path.relative_to(backup_root)
+        destinations.append((backup_path, Path(backup_path.anchor, *relative_path.parts)))
+    return destinations
+
+
+def restore_destination_is_writable_on_this_platform(destination_path: Path) -> bool:
+    source_text = str(destination_path)
+    if WINDOWS_DRIVE_PATH_PATTERN.match(source_text) and os.name != "nt":
+        return False
+    return True
+
+
+def writable_rollout_destinations(rollout_destinations: list[tuple[Path, Path]]) -> tuple[list[tuple[Path, Path]], int]:
+    writable_destinations = []
+    skipped_count = 0
+    for backup_path, destination_path in rollout_destinations:
+        if restore_destination_is_writable_on_this_platform(destination_path):
+            writable_destinations.append((backup_path, destination_path))
+        else:
+            skipped_count += 1
+    return writable_destinations, skipped_count
 
 
 def rewrite_rollout_text(text: str, target_provider: str) -> str:
@@ -253,6 +350,9 @@ def rewrite_rollouts_in_place(
         source_path.write_text(rewritten_text, encoding="utf-8")
         os.utime(source_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
+    if apply:
+        write_rollout_backup_manifest(run_dir, backup_paths)
+
     return backup_paths, missing_count
 
 
@@ -268,15 +368,10 @@ def backup_database(conn: sqlite3.Connection, run_dir: Path, state_path: Path) -
 
 
 def rollout_restore_destinations(run_dir: Path) -> list[tuple[Path, Path]]:
-    backup_root = run_dir / "rollout-backups"
-    if not backup_root.exists():
-        return []
-
-    destinations: list[tuple[Path, Path]] = []
-    for backup_path in sorted(path for path in backup_root.rglob("*") if path.is_file()):
-        relative_path = backup_path.relative_to(backup_root)
-        destinations.append((backup_path, Path(backup_path.anchor, *relative_path.parts)))
-    return destinations
+    manifest_destinations = manifest_rollout_restore_destinations(run_dir)
+    if manifest_destinations:
+        return manifest_destinations
+    return legacy_rollout_restore_destinations(run_dir)
 
 
 def backup_current_state_for_rollback(run_dir: Path, state_path: Path) -> Path:
@@ -306,20 +401,21 @@ def rollback_backup_run(run_dir: Path, *, state_path: Path, apply: bool) -> Roll
         raise FileNotFoundError(f"SQLite backup not found: {sqlite_backup_path}")
 
     rollout_destinations = rollout_restore_destinations(run_dir)
+    writable_destinations, skipped_rollouts = writable_rollout_destinations(rollout_destinations)
     current_backup_path = None
     if apply:
         current_backup_path = backup_current_state_for_rollback(run_dir, state_path)
         remove_sqlite_sidecars(state_path)
         shutil.copy2(sqlite_backup_path, state_path)
-        for backup_path, destination_path in rollout_destinations:
+        for backup_path, destination_path in writable_destinations:
             destination_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(backup_path, destination_path)
 
     return RollbackResult(
         run_dir=run_dir,
         sqlite_backup_path=sqlite_backup_path,
-        restored_rollouts=len(rollout_destinations),
-        missing_rollouts=0,
+        restored_rollouts=len(writable_destinations),
+        missing_rollouts=skipped_rollouts,
         current_backup_path=current_backup_path,
     )
 
@@ -401,25 +497,27 @@ def restore_threads(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = CodexRestoreArgumentParser(
         description="Restore Codex Desktop conversations after model provider changes.",
+    )
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        help="Codex home directory. Sets default --state, --config, and --output-root.",
     )
     parser.add_argument(
         "--state",
         type=Path,
-        default=DEFAULT_CODEX_HOME / "state_5.sqlite",
         help="Path to Codex state SQLite database.",
     )
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_CODEX_HOME / "config.toml",
         help="Path to Codex config.toml used to read the current model_provider.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=DEFAULT_CODEX_HOME / "provider-restore-rollouts",
         help="Directory where SQLite and rollout backups are stored.",
     )
     parser.add_argument(

@@ -54,10 +54,32 @@ def make_restore_backup_run(output_root, run_name, state_path, rollout_path, rol
     backup_dir.mkdir(parents=True)
     shutil.copy2(state_path, backup_dir / "state_5.sqlite.before-provider-restore.sqlite")
 
-    rollout_backup_path = run_dir / "rollout-backups" / Path(*rollout_path.parts[1:])
+    rollout_backup_path = tool_path_for_backup(run_dir, rollout_path)
     rollout_backup_path.parent.mkdir(parents=True)
     rollout_backup_path.write_text(rollout_text, encoding="utf-8")
+    manifest_path = run_dir / "rollout-backups" / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            [
+                {
+                    "source_path": str(rollout_path),
+                    "backup_path": str(rollout_backup_path.relative_to(run_dir / "rollout-backups")),
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     return run_dir
+
+
+def tool_path_for_backup(run_dir, rollout_path):
+    path = Path(rollout_path)
+    if path.is_absolute():
+        relative_parts = path.parts[1:]
+    else:
+        relative_parts = path.parts
+    return run_dir / "rollout-backups" / Path(*relative_parts)
 
 
 def make_state_db_with_timestamps(path, rollout_path):
@@ -127,6 +149,56 @@ class CodexProviderRestoreTests(unittest.TestCase):
             (output_root / "notes").mkdir()
 
             self.assertEqual([path.name for path in tool.list_backup_runs(output_root)], valid_runs)
+
+    def test_destination_for_rollout_backup_handles_windows_drive_paths(self):
+        tool = load_tool()
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "20260629-120000"
+
+            backup_path = tool.destination_for_rollout_backup(
+                run_dir,
+                Path(r"C:\Users\me\.codex\sessions\rollout.jsonl"),
+            )
+
+            self.assertEqual(
+                backup_path,
+                run_dir / "rollout-backups" / "C" / "Users" / "me" / ".codex" / "sessions" / "rollout.jsonl",
+            )
+
+    def test_rollout_restore_destinations_uses_manifest_for_windows_paths(self):
+        tool = load_tool()
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "20260629-120000"
+            backup_root = run_dir / "rollout-backups"
+            backup_file = backup_root / "C" / "Users" / "me" / ".codex" / "sessions" / "rollout.jsonl"
+            backup_file.parent.mkdir(parents=True)
+            backup_file.write_text("backup", encoding="utf-8")
+            (backup_root / "manifest.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "source_path": r"C:\Users\me\.codex\sessions\rollout.jsonl",
+                            "backup_path": "C/Users/me/.codex/sessions/rollout.jsonl",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            destinations = tool.rollout_restore_destinations(run_dir)
+
+            self.assertEqual(destinations, [(backup_file, Path(r"C:\Users\me\.codex\sessions\rollout.jsonl"))])
+
+    def test_parser_codex_home_sets_related_default_paths(self):
+        tool = load_tool()
+
+        args = tool.build_parser().parse_args(["--codex-home", "/tmp/codex-home"])
+
+        self.assertEqual(args.state, Path("/tmp/codex-home/state_5.sqlite"))
+        self.assertEqual(args.config, Path("/tmp/codex-home/config.toml"))
+        self.assertEqual(args.output_root, Path("/tmp/codex-home/provider-restore-rollouts"))
 
     def test_rollback_backup_run_dry_run_reports_without_modifying_files(self):
         tool = load_tool()

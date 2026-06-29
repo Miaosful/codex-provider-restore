@@ -41,15 +41,19 @@ failed to load configuration: Model provider `custom` not found
    `~/.codex/sessions` 或 `~/.codex/archived_sessions` 路径。
 
 数据库中的 `rollout_path` 不会被改到恢复目录；恢复目录只保存备份。
+rollout 备份会写入 `manifest.json` 记录原始路径，用于安全恢复 macOS 和
+Windows 路径。
 
 为避免备份无限增长，`--apply` 成功后会自动清理旧运行目录，默认只保留
 `~/.codex/provider-restore-rollouts` 下最近 5 次备份。
 
 ### 环境要求
 
-- 仅适用于 macOS
+- macOS 已验证
+- Windows 为实验性支持：如果 Windows 客户端状态目录不在 `~\.codex`，
+  请使用 `--codex-home` 或显式传入 `--state`、`--config`、`--output-root`
 - 推荐 Python 3.11 或更新版本
-- Codex Desktop 本地状态目录位于 `~/.codex`
+- Codex Desktop 本地状态目录默认按 `~/.codex` 解析
 
 脚本只使用 Python 标准库。
 
@@ -114,6 +118,14 @@ python3 codex_provider_restore.py \
   --output-root ~/.codex/provider-restore-rollouts \
   --apply
 ```
+
+Windows 或自定义 Codex 状态目录：
+
+```powershell
+python codex_provider_restore.py --codex-home "$env:USERPROFILE\.codex" --apply
+```
+
+`--codex-home` 会同时设置默认的 `--state`、`--config` 和 `--output-root`。
 
 只清理旧备份、不修复会话：
 
@@ -234,6 +246,8 @@ When run with `--apply`, it:
 
 The restore directory is used only for backups; database `rollout_path` values
 stay on the original session or archived-session files.
+Rollout backups include a `manifest.json` with original paths so macOS and
+Windows paths can be restored safely.
 
 To prevent backups from growing forever, a successful `--apply` run
 automatically removes old run directories and keeps only the newest 5 backups
@@ -241,9 +255,12 @@ under `~/.codex/provider-restore-rollouts` by default.
 
 ### Requirements
 
-- macOS only
+- macOS verified
+- Windows experimental: if the Windows client stores state somewhere other than
+  `~\.codex`, use `--codex-home` or pass `--state`, `--config`, and
+  `--output-root` explicitly
 - Python 3.11 or newer recommended
-- Codex Desktop local state at `~/.codex`
+- Codex Desktop local state defaults to `~/.codex`
 
 The script only uses Python standard library modules.
 
@@ -340,6 +357,15 @@ python3 codex_provider_restore.py \
   --output-root ~/.codex/provider-restore-rollouts \
   --apply
 ```
+
+Windows or custom Codex state directory:
+
+```powershell
+python codex_provider_restore.py --codex-home "$env:USERPROFILE\.codex" --apply
+```
+
+`--codex-home` sets the default `--state`, `--config`, and `--output-root`
+paths together.
 
 ### Output
 
